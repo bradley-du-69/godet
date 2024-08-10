@@ -214,6 +214,7 @@ type RemoteDebugger struct {
 	requests  chan Params
 	responses map[int]chan json.RawMessage
 	callbacks map[string]EventCallback
+	domains   map[string]bool
 	events    chan wsMessage
 }
 
@@ -272,6 +273,7 @@ func Connect(port string, verbose bool, options ...ConnectOption) (*RemoteDebugg
 		requests:  make(chan Params),
 		responses: map[int]chan json.RawMessage{},
 		callbacks: map[string]EventCallback{},
+		domains:   map[string]bool{},
 		events:    make(chan wsMessage, 256),
 		closed:    make(chan bool),
 		verbose:   verbose,
@@ -637,6 +639,12 @@ func (remote *RemoteDebugger) ActivateTab(tab *Tab) error {
 
 	if err == nil {
 		err = remote.connectWs(tab)
+
+		if err == nil {
+			for domain, state := range remote.domains {
+				remote.DomainEvents(domain, state)
+			}
+		}
 	}
 
 	return err
@@ -656,7 +664,7 @@ func (remote *RemoteDebugger) NewTab(url string) (*Tab, error) {
 		path += "?" + url
 	}
 
-	resp, err := responseError(remote.http.Do(remote.http.Request("GET", path, nil, nil)))
+	resp, err := responseError(remote.http.Do(remote.http.Request("PUT", path, nil, nil)))
 	if err != nil {
 		return nil, err
 	}
@@ -696,9 +704,42 @@ func (remote *RemoteDebugger) GetDomains() ([]Domain, error) {
 
 // Navigate navigates to the specified URL.
 func (remote *RemoteDebugger) Navigate(url string) (string, error) {
-	res, err := remote.SendRequest("Page.navigate", Params{
+	return remote.NavigateTransition(url, NoTransition)
+}
+
+type TransitionType string
+
+const (
+	NoTransition = TransitionType("")
+	Reload       = TransitionType("reload")
+
+/*
+"link",
+"typed",
+"address_bar",
+"auto_bookmark",
+"auto_subframe",
+"manual_subframe",
+"generated",
+"auto_toplevel",
+"form_submit",
+"reload",
+"keyword",
+"keyword_generated",
+"other"
+*/
+)
+
+func (remote *RemoteDebugger) NavigateTransition(url string, trans TransitionType) (string, error) {
+	params := Params{
 		"url": url,
-	})
+	}
+
+	if trans != NoTransition {
+		params["transitionType"] = string(trans)
+	}
+
+	res, err := remote.SendRequest("Page.navigate", params)
 	if err != nil {
 		return "", err
 	}
@@ -1271,16 +1312,25 @@ func (remote *RemoteDebugger) FailRequest(requestID string, errorReason ErrorRea
 // FulfillRequest provides a response to the request.
 func (remote *RemoteDebugger) FulfillRequest(requestID string, responseCode int, responsePhrase string, headers map[string]string, body []byte) error {
 	params := Params{
-		"requestId":       requestID,
-		"responseCode":    responseCode,
-		"responseHeaders": headers,
+		"requestId":    requestID,
+		"responseCode": responseCode,
 	}
 
 	if responsePhrase != "" {
 		params["responsePhrase"] = responsePhrase
 	}
 
-	if body != nil {
+	if len(headers) > 0 {
+		var hlist = []map[string]string{}
+
+		for k, v := range headers {
+			hlist = append(hlist, map[string]string{"name": k, "value": v})
+		}
+
+		params["responseHeaders"] = hlist
+	}
+
+	if len(body) > 0 {
 		params["body"] = body
 	}
 
@@ -1787,7 +1837,7 @@ func (remote *RemoteDebugger) GetPreciseCoverage(precise bool) ([]interface{}, e
 	if res == nil || err != nil {
 		return nil, err
 	}
-	log.Println(res)
+	//log.Println(res)
 	return res["result"].([]interface{}), nil
 }
 
@@ -1804,8 +1854,10 @@ func (remote *RemoteDebugger) DomainEvents(domain string, enable bool) error {
 	method := domain
 
 	if enable {
+		remote.domains[method] = true
 		method += ".enable"
 	} else {
+		delete(remote.domains, method)
 		method += ".disable"
 	}
 
@@ -1844,6 +1896,52 @@ func (remote *RemoteDebugger) NetworkEvents(enable bool) error {
 	return remote.DomainEvents("Network", enable)
 }
 
+// TargetEvents enables Target events listening.
+func (remote *RemoteDebugger) TargetEvents(enable bool) error {
+	return remote.DomainEvents("Target", enable)
+}
+
+// Retrieves a list of available targets.
+func (remote *RemoteDebugger) GetTargets() (map[string]interface{}, error) {
+	resp, err := remote.SendRequest("Target.getTargets", Params{})
+
+	return resp, err
+}
+
+// Controls whether to discover available targets and notify via
+// `targetCreated/targetInfoChanged/targetDestroyed` events."
+func (remote *RemoteDebugger) SetDiscoverTargets(discover bool) error {
+	_, err := remote.SendRequest("Target.setDiscoverTargets", Params{
+		"discover": discover,
+	})
+	return err
+}
+
+// Controls whether to automatically attach to new targets which are considered to be related to
+// this one. When turned on, attaches to all existing related targets as well. When turned off,
+// automatically detaches from all currently attached targets.
+// This also clears all targets added by `autoAttachRelated` from the list of targets to watch
+// for creation of related targets.",
+func (remote *RemoteDebugger) SetAutoAttach(autoAttach bool) error {
+	_, err := remote.SendRequest("Target.setAutoAttach", Params{
+		"autoAttach": autoAttach,
+	})
+	return err
+}
+
+// Attaches to the target with given id.
+func (remote *RemoteDebugger) AttachToTarget(targetId string) (string, error) {
+	res, err := remote.SendRequest("Target.attachToTarget", Params{
+		"targetId": targetId,
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	return res["sessionId"].(string), nil
+}
+
 // RuntimeEvents enables Runtime events listening.
 func (remote *RemoteDebugger) RuntimeEvents(enable bool) error {
 	return remote.DomainEvents("Runtime", enable)
@@ -1876,6 +1974,54 @@ func (remote *RemoteDebugger) DebuggerSkipAllPauses(skip bool) error {
 		"skip": skip,
 	})
 	return err
+}
+
+func (remote *RemoteDebugger) DebuggerSetBreakpointsActive(active bool) error {
+	_, err := remote.SendRequest("Debugger.setBreakpointsActive", Params{
+		"active": active,
+	})
+	return err
+}
+
+func (remote *RemoteDebugger) GetScriptSource(id string) (string, error) {
+	res, err := remote.SendRequest("Debugger.getScriptSource", Params{
+		"scriptId": id,
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	// should check for bytecode (wasm)
+	ss := res["scriptSource"]
+	if ss == nil {
+		return "", nil
+	}
+
+	return ss.(string), nil
+}
+
+func (remote *RemoteDebugger) SetScriptSource(id, source string) error {
+	res, err := remote.SendRequest("Debugger.setScriptSource", Params{
+		"scriptId":     id,
+		"scriptSource": source,
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if res == nil {
+		//log.Println("SetScriptSource: NO RESPONSE")
+		return nil
+	}
+
+	status := res["status"].(string)
+	if status == "Ok" {
+		return nil
+	}
+
+	return errors.New(status)
 }
 
 // ProfilerEvents enables Profiler events listening.

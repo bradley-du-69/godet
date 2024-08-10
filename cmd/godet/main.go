@@ -19,7 +19,9 @@ import (
 
 func runCommand(commandString string) error {
 	parts := args.GetArgs(commandString)
-	cmd := exec.Command(parts[0], parts[1:]...)
+	exe := strings.Replace(parts[0], "\u00A0", " ", -1)
+
+	cmd := exec.Command(exe, parts[1:]...)
 	return cmd.Start()
 }
 
@@ -75,6 +77,19 @@ func main() {
 			}
 
 		case "windows":
+			for _, c := range []string{
+				"C:/Program Files (x86)/Google/Chrome/Application/chrome.exe",
+				"C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+			} {
+				if _, err := exec.LookPath(c); err == nil {
+					if strings.Contains(c, " ") {
+						chromeapp = `"` + strings.Replace(c, " ", "\u00A0", -1) + `"`
+					} else {
+						chromeapp = c
+					}
+					break
+				}
+			}
 		}
 	}
 
@@ -89,14 +104,15 @@ func main() {
 	}
 
 	cmd := flag.String("cmd", chromeapp, "command to execute to start the browser")
-	headless := flag.Bool("headless", true, "headless mode")
+	headless := flag.String("headless", "", "headless mode (true/false, old or new)")
 	port := flag.String("port", "localhost:9222", "Chrome remote debugger port")
 	verbose := flag.Bool("verbose", false, "verbose logging")
 	version := flag.Bool("version", false, "display remote devtools version")
 	protocol := flag.Bool("protocol", false, "display the DevTools protocol")
 	listtabs := flag.Bool("tabs", false, "show list of open tabs")
-	seltab := flag.Int("tab", 0, "select specified tab if available")
+	seltab := flag.Int("tab", -1, "select specified tab if available")
 	newtab := flag.Bool("new", false, "always open a new tab")
+	listtargets := flag.Bool("targets", false, "show list of targets")
 	history := flag.Bool("history", false, "display page history")
 	filter := flag.String("filter", "page", "filter tab list")
 	domains := flag.Bool("domains", false, "show list of available domains")
@@ -127,8 +143,13 @@ func main() {
 	flag.Parse()
 
 	if *cmd != "" {
-		if !*headless {
-			*cmd = strings.Replace(*cmd, " --headless ", " ", -1)
+		if *headless != "" {
+			hparam := fmt.Sprintf(" --headless=%v ", *headless)
+			if *headless == "false" {
+				hparam = " "
+			}
+
+			*cmd = strings.Replace(*cmd, " --headless ", hparam, -1)
 		}
 
 		if err := runCommand(*cmd); err != nil {
@@ -139,9 +160,9 @@ func main() {
 	var remote *godet.RemoteDebugger
 	var err error
 
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 20; i++ {
 		if i > 0 {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(time.Second)
 		}
 
 		remote, err = godet.Connect(*port, *verbose)
@@ -191,6 +212,16 @@ func main() {
 		}
 
 		pretty.PrettyPrint(tabs)
+		shouldWait = false
+	}
+
+	if *listtargets {
+		targets, err := remote.GetTargets()
+		if err != nil {
+			log.Fatal("cannot get list of targets: ", err)
+		}
+
+		pretty.PrettyPrint(targets)
 		shouldWait = false
 	}
 
@@ -315,28 +346,26 @@ func main() {
 
 	var site string
 
+	tabs, err := remote.TabList("page")
+	if err != nil {
+		log.Fatal("cannot get tabs: ", err)
+	}
+	if *seltab >= 0 && *seltab < len(tabs) {
+		if err = remote.ActivateTab(tabs[*seltab]); err != nil {
+			log.Println("cannot select tab", *seltab)
+		}
+	}
+
 	if flag.NArg() > 0 {
 		site = flag.Arg(0)
-
-		tabs, err := remote.TabList("page")
-		if err != nil {
-			log.Fatal("cannot get tabs: ", err)
-		}
 
 		if len(tabs) == 0 || *newtab {
 			_, err = remote.NewTab(site)
 			site = ""
-		} else {
-			tab := *seltab
-			if tab > len(tabs) {
-				tab = 0
+
+			if err != nil {
+				log.Fatal("error loading page: ", err)
 			}
-
-			err = remote.ActivateTab(tabs[tab])
-		}
-
-		if err != nil {
-			log.Fatal("error loading page: ", err)
 		}
 	}
 
@@ -353,6 +382,7 @@ func main() {
 		remote.LogEvents(true)
 		remote.EmulationEvents(true)
 		remote.ServiceWorkerEvents(true)
+		//remote.TargetEvents(true)
 	}
 
 	if *download != "" {
